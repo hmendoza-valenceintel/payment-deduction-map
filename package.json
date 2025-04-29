@@ -1,0 +1,24 @@
+{
+  "name": "payment-deduction-map",
+  "version": "1.0.0",
+  "description": "Payment Deduction Map",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "watch": "tsc -w"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@valencemi/amazon_vendor_central_db_model": "^22.0.0",
+    "dotenv": "^16.5.0"
+  }
+}
