@@ -60,6 +60,51 @@ async function fetchVendors(vendorIds: number[]) {
   });
 }
 
+// Helper func to build a map of vendor cases from deductions
+async function buildVendorCaseMap(
+  deductions: any[]
+): Promise<Map<number, any>> {
+  const vendorCaseIds = Array.from(
+    new Set(
+      deductions
+        .map((d) => d.ReversalForVendorCaseId)
+        .filter((id): id is number => typeof id === 'number')
+    )
+  ); // Using a Set constructor to avoid potential duplicates
+
+  // Fetch Vendor Cases
+  const vendorCases = await fetchVendorCases(vendorCaseIds);
+
+  // Build a map of vendor cases by <id, vendorCase> and return it
+  return new Map(
+    vendorCases
+      .filter((vc) => typeof vc.Id === 'number')
+      .map((vc) => [vc.Id as number, vc])
+  );
+}
+
+// Helper to build a map of vendors from vendorCases
+async function buildVendorMap(vendorCases: any[]): Promise<Map<number, any>> {
+  // Build a list of vendorIds from vendorCases
+  const vendorIds = Array.from(
+    new Set(
+      vendorCases
+        .map((vc) => vc.VendorId)
+        .filter((id): id is number => typeof id === 'number')
+    )
+  );
+
+  // Fetch Vendors
+  const vendors = await fetchVendors(vendorIds);
+
+  // Build a map of vendors by <id, vendor> and return it
+  return new Map(
+    vendors
+      .filter((v) => typeof v.Id === 'number')
+      .map((v) => [v.Id as number, v])
+  );
+}
+
 function buildDeductionMap(deductions: any[]) {
   // Build a map of deductions by <key, deductions>
   const deductionMap = new Map();
@@ -209,51 +254,6 @@ async function mapPaymentToDeduction(
   }
 }
 
-// Helper func to build a map of vendor cases from deductions
-async function buildVendorCaseMap(
-  deductions: any[]
-): Promise<Map<number, any>> {
-  const vendorCaseIds = Array.from(
-    new Set(
-      deductions
-        .map((d) => d.ReversalForVendorCaseId)
-        .filter((id): id is number => typeof id === 'number')
-    )
-  ); // Using a Set constructor to avoid potential duplicates
-
-  // Fetch Vendor Cases
-  const vendorCases = await fetchVendorCases(vendorCaseIds);
-
-  // Build a map of vendor cases by <id, vendorCase> and return it
-  return new Map(
-    vendorCases
-      .filter((vc) => typeof vc.Id === 'number')
-      .map((vc) => [vc.Id as number, vc])
-  );
-}
-
-// Helper to build a map of vendors from vendorCases
-async function buildVendorMap(vendorCases: any[]): Promise<Map<number, any>> {
-  // Build a list of vendorIds from vendorCases
-  const vendorIds = Array.from(
-    new Set(
-      vendorCases
-        .map((vc) => vc.VendorId)
-        .filter((id): id is number => typeof id === 'number')
-    )
-  );
-
-  // Fetch Vendors
-  const vendors = await fetchVendors(vendorIds);
-
-  // Build a map of vendors by <id, vendor> and return it
-  return new Map(
-    vendors
-      .filter((v) => typeof v.Id === 'number')
-      .map((v) => [v.Id as number, v])
-  );
-}
-
 export async function main() {
   const startTime = Date.now();
   const sequelize = connectToDatabase();
@@ -268,10 +268,10 @@ export async function main() {
     console.log(`Found ${deductions.length} unmapped deductions.`);
 
     // Step 2: Prepare batch data
-    const vendorCaseMap = await buildVendorCaseMap(deductions);
+    const vendorCaseMap = await buildVendorCaseMap(deductions); // Vendor Cases
     const vendorCasesList = Array.from(vendorCaseMap.values());
-    const vendorMap = await buildVendorMap(vendorCasesList);
-    const deductionMap = buildDeductionMap(deductions);
+    const vendorMap = await buildVendorMap(vendorCasesList); // Vendors
+    const deductionMap = buildDeductionMap(deductions); // Deductions
 
     // Step 3: Process payments mapping
     await processPayments(
