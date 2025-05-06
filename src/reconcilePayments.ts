@@ -3,6 +3,7 @@ import db, {
   BillingLedger,
   VendorCase,
   Vendor,
+  AuditManual,
 } from '@valencemi/amazon_vendor_central_db_model';
 import { Sequelize, Transaction, Op } from 'sequelize';
 import 'dotenv/config';
@@ -31,8 +32,8 @@ async function fetchUnmappedPayments() {
     where: {
       InvoiceAmount: { [Op.gt]: 0 }, // positive amount
       PaymentRemittanceId: { [Op.is]: null as any }, // not mapped
+      InvoiceCurrency: 'USD',
     },
-    raw: true,
   });
 }
 
@@ -41,68 +42,25 @@ async function fetchUnmappedDeductions() {
     where: {
       InvoiceAmount: { [Op.lt]: 0 }, // negative amount
       PaymentRemittanceId: { [Op.is]: null as any }, // not mapped
+      InvoiceCurrency: 'USD',
     },
-    raw: true,
+    include: [
+      {
+        model: AuditManual,
+        required: true,
+        include: [
+          {
+            model: Vendor,
+            required: true,
+          },
+          {
+            model: VendorCase,
+            required: true,
+          },
+        ],
+      },
+    ],
   });
-}
-
-async function fetchVendorCases(deductionsVendorCaseIds: number[]) {
-  return VendorCase.findAll({
-    where: { Id: { [Op.in]: deductionsVendorCaseIds } },
-    raw: true,
-  });
-}
-
-async function fetchVendors(vendorIds: number[]) {
-  return Vendor.findAll({
-    where: { Id: { [Op.in]: vendorIds } },
-    raw: true,
-  });
-}
-
-// Helper func to build a map of vendor cases from deductions
-async function buildVendorCaseMap(
-  deductions: any[]
-): Promise<Map<number, any>> {
-  const vendorCaseIds = Array.from(
-    new Set(
-      deductions
-        .map((d) => d.ReversalForVendorCaseId)
-        .filter((id): id is number => typeof id === 'number')
-    )
-  ); // Using a Set constructor to avoid potential duplicates
-
-  // Fetch Vendor Cases
-  const vendorCases = await fetchVendorCases(vendorCaseIds);
-
-  // Build a map of vendor cases by <id, vendorCase> and return it
-  return new Map(
-    vendorCases
-      .filter((vc) => typeof vc.Id === 'number')
-      .map((vc) => [vc.Id as number, vc])
-  );
-}
-
-// Helper to build a map of vendors from vendorCases
-async function buildVendorMap(vendorCases: any[]): Promise<Map<number, any>> {
-  // Build a list of vendorIds from vendorCases
-  const vendorIds = Array.from(
-    new Set(
-      vendorCases
-        .map((vc) => vc.VendorId)
-        .filter((id): id is number => typeof id === 'number')
-    )
-  );
-
-  // Fetch Vendors
-  const vendors = await fetchVendors(vendorIds);
-
-  // Build a map of vendors by <id, vendor> and return it
-  return new Map(
-    vendors
-      .filter((v) => typeof v.Id === 'number')
-      .map((v) => [v.Id as number, v])
-  );
 }
 
 function buildDeductionMap(deductions: any[]) {
@@ -116,11 +74,30 @@ function buildDeductionMap(deductions: any[]) {
   return deductionMap;
 }
 
+function calculateBillableAmount(
+  amount: number | string,
+  gainshareRate: number | string
+): string {
+  const amt = parseFloat(String(amount ?? '0'));
+  const rate = parseFloat(String(gainshareRate ?? '0'));
+  return (amt * rate).toFixed(4);
+}
+
+function hasDuplicateInvoiceAmounts(deductions: any[]): boolean {
+  const invoiceAmounts = new Set<string>();
+  for (const deduction of deductions) {
+    const invoiceAmount = String(deduction.InvoiceAmount ?? '');
+    if (invoiceAmounts.has(invoiceAmount)) {
+      return true; // duplicate invoice amount
+    }
+    invoiceAmounts.add(invoiceAmount);
+  }
+  return false;
+}
+
 async function processPayments(
   payments: any[], // List of payments
   deductionMap: Map<string, any[]>, // Map of deductions by <key, deductions>
-  vendorCaseMap: Map<number, any>, // Map of vendor cases by <id, vendorCase>
-  vendorMap: Map<number, any>, // Map of vendors by <id, vendor>
   sequelize: Sequelize
 ) {
   for (const payment of payments) {
@@ -133,15 +110,21 @@ async function processPayments(
     const key = `${payment.VendorId}|${payment.RootInvoiceNumber}`;
     const deductionsForKey = (deductionMap.get(key) || []) as any[];
 
+    // Skip if no deductions found
+    if (deductionsForKey.length === 0) continue;
+
+    // Pre-validation: Check if any deductions share the same invoice amount
+    if (hasDuplicateInvoiceAmounts(deductionsForKey)) {
+      console.log(
+        `Skipping key ${key} - multiple deductions found with same invoice amount. Requires manual validation.`
+      );
+      continue;
+    }
+
     for (const deduction of deductionsForKey) {
       if (deduction.InvoiceDate > payment.InvoiceDate) continue; // Skip if deduction date is after payment date
-      const mapped = await mapPaymentToDeduction(
-        payment,
-        deduction,
-        vendorCaseMap,
-        vendorMap,
-        sequelize
-      );
+
+      const mapped = await mapPaymentToDeduction(payment, deduction, sequelize);
       if (mapped) break; // Only map one deduction per payment
     }
   }
@@ -150,8 +133,6 @@ async function processPayments(
 async function mapPaymentToDeduction(
   payment: any,
   deduction: any,
-  vendorCaseMap: Map<number, any>,
-  vendorMap: Map<number, any>,
   sequelize: Sequelize
 ) {
   // Identify deduction claim type
@@ -167,6 +148,17 @@ async function mapPaymentToDeduction(
   )
     return false;
 
+  const auditManual = deduction.AuditManuals?.[0];
+  if (!auditManual) {
+    console.log(`Deduction ${deduction.Id} has no AuditManual`);
+    return false;
+  }
+
+  const vendorCase = auditManual.VendorCase;
+  const vendor = auditManual.Vendor;
+
+  if (!vendorCase || !vendor || vendorCase.IsValidCase == null) return false;
+
   // Amount match
   // Only match if payment amount exactly equals the absolute value of the deduction amount
   if (
@@ -175,37 +167,26 @@ async function mapPaymentToDeduction(
   )
     return false;
 
-  // Check for valid Vendor Case
-  if (!deduction.ReversalForVendorCaseId) return false;
-  const vendorCase = vendorCaseMap.get(deduction.ReversalForVendorCaseId);
-  if (!vendorCase || vendorCase.IsValidCase == null) return false;
-
-  // Get OrganizationId from Vendor
-  const vendor = vendorMap.get(vendorCase.VendorId);
-  const organizationId = vendor?.OrganizationId;
-  if (!organizationId) return false;
-
-  // Update in a transaction
   try {
     await sequelize.transaction(async (t: Transaction) => {
-      // Add spacing and separator for readability
       console.log(
         '\n-----------------Initializing Transaction-----------------'
       );
       console.log(
-        `Processing: ${payment.InvoiceNumber} (${payment.InvoiceAmount}) -> ${deduction.InvoiceNumber} (${deduction.InvoiceAmount})`
+        `Processing: Payment ${payment.Id} (${payment.InvoiceNumber}, ${payment.InvoiceAmount}) -> Deduction ${deduction.Id} (${deduction.InvoiceNumber}, ${deduction.InvoiceAmount})`
       );
+
       // Update deduction
       await RemittanceInvoices.update(
         { PaymentRemittanceId: payment.Id },
         { where: { Id: deduction.Id }, transaction: t }
       );
 
-      // Check if BillingLedger entry already exists
+      // Check for existing billing ledger
       const existingBillingLedger = await BillingLedger.findOne({
         where: {
-          VendorId: payment.VendorId,
-          OrganizationId: organizationId,
+          VendorId: vendor.Id,
+          OrganizationId: vendor.OrganizationId,
           BillingKey: String(payment.PaymentNumber ?? ''),
           BillingKey2: String(payment.InvoiceNumber ?? ''),
           KeySource: 'RemittanceInvoice',
@@ -213,24 +194,32 @@ async function mapPaymentToDeduction(
         transaction: t,
       });
 
-      // Only create new entry if one doesn't exist
       if (!existingBillingLedger) {
+        // Calculate BillableAmount using vendor's GainshareRate
+        const billableAmount = calculateBillableAmount(
+          payment.InvoiceAmount,
+          vendor.GainshareRate
+        );
+
         const newLedger = await BillingLedger.create(
           {
-            VendorId: payment.VendorId,
-            OrganizationId: organizationId,
+            VendorId: vendor.Id,
+            OrganizationId: vendor.OrganizationId,
             BillingKey: String(payment.PaymentNumber ?? ''),
             BillingKey2: String(payment.InvoiceNumber ?? ''),
             KeySource: 'RemittanceInvoice',
             Amount: String(payment.InvoiceAmount ?? ''),
             CurrencyCode: String(payment.InvoiceCurrency ?? ''),
+            BillableAmount: billableAmount,
+            BillableAmountCurrencyCode: payment.InvoiceCurrency,
             Description: `Billing for ${payment.InvoiceNumber}`,
-            CaseId: deduction.ReversalForVendorCaseId?.toString(),
+            CaseId: vendorCase.Id?.toString(),
             DateCreated: new Date(),
             CreatedBy: 'auto-mapper-script',
           },
           { transaction: t }
         );
+
         console.log(
           `Created BillingLedger entry with id: ${newLedger.Id} for payment ${payment.InvoiceNumber}`
         );
@@ -239,17 +228,23 @@ async function mapPaymentToDeduction(
           `Skipped creating billing ledger for payment ${payment.InvoiceNumber} because it already exists with id: ${existingBillingLedger.Id}`
         );
       }
-      // Add a separator after each mapping/skip
-      console.log('--------------------------------------------------\n');
-    });
-    console.log(`Mapped payment ${payment.Id} to deduction ${deduction.Id}`);
-    mappedPaymentsCount++; // Increment counter on successful mapping
+    }); // End of transaction
+
+    console.log(
+      `Successfully mapped payment ${payment.Id} to deduction ${deduction.Id}`
+    );
+
+    // Add a separator after each mapping/skip
+    console.log('----------------------------------------------------------\n');
+
+    mappedPaymentsCount++;
     return true;
   } catch (error) {
     console.error(
-      `Error mapping payment ${payment.Id} to deduction ${deduction.Id}:`,
+      `TRANSACTION ERROR: Error mapping payment ${payment.Id} to deduction ${deduction.Id}:`,
       error
     );
+    console.log('----------------------------------------------------------\n');
     return false;
   }
 }
@@ -264,24 +259,18 @@ export async function main() {
     // Step 1: Fetch unmapped payments and deductions
     const payments = await fetchUnmappedPayments();
     console.log(`Found ${payments.length} unmapped payments.`);
+
     const deductions = await fetchUnmappedDeductions();
     console.log(`Found ${deductions.length} unmapped deductions.`);
 
-    // Step 2: Prepare batch data
-    const vendorCaseMap = await buildVendorCaseMap(deductions); // Vendor Cases
-    const vendorCasesList = Array.from(vendorCaseMap.values());
-    const vendorMap = await buildVendorMap(vendorCasesList); // Vendors
-    const deductionMap = buildDeductionMap(deductions); // Deductions
+    // Step 2: Build deduction map
+    const deductionMap = buildDeductionMap(deductions);
+    console.log('Deduction map keys:');
 
     // Step 3: Process payments mapping
-    await processPayments(
-      payments,
-      deductionMap,
-      vendorCaseMap,
-      vendorMap,
-      sequelize
-    );
-    console.log('Auto-mapping complete.');
+    await processPayments(payments, deductionMap, sequelize);
+
+    console.log('\nAuto-mapping complete.');
     console.log(
       `Successfully mapped ${mappedPaymentsCount} payments out of ${payments.length} total payments.`
     );
